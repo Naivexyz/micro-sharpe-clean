@@ -37,6 +37,15 @@ import type { Batch, Bot, BotState, OrderInput, Pubkey } from './vendor/makefun-
 
 const SOL = 1_000_000_000;
 
+/** Basis points in a whole. Fee math divides by this, and a sell's slippage
+ *  tolerance is set to all of it: an exit must land, never strand. */
+const BPS_WHOLE = 10_000;
+/** Smallest buy worth sending, in SOL: below the ~0.01 SOL round-trip fee
+ *  floor a trade cannot pay for itself, so it is not worth a slot. */
+const MIN_BUY_SOL = 0.012;
+/** Slots entries stay paused after a hard-drawdown breach. */
+const DD_PAUSE_SLOTS = 600;
+
 export interface Params {
   /** Long window the trend is judged over, in slots. */
   trendWindow: number;
@@ -207,7 +216,7 @@ export function createStrategy(params: Params): Bot {
     if (c === undefined || tokens <= 0n) return 0n;
     const gross = (tokens * c.virtual_quote_reserves) / (c.virtual_token_reserves + tokens);
     const feeBps = BigInt(state.hello.fees.protocol_bps_fallback + state.hello.fees.creator_bps_fallback);
-    return gross - (gross * feeBps) / 10_000n;
+    return gross - (gross * feeBps) / BigInt(BPS_WHOLE);
   };
 
   /** Window statistics for one mint, or null when the tape is too thin to judge. */
@@ -316,7 +325,7 @@ export function createStrategy(params: Params): Bot {
       }
       if (equity > peakEquity) peakEquity = equity;
       const drawdown = peakEquity > 0n ? Number(peakEquity - equity) / Number(peakEquity) : 0;
-      if (drawdown > params.ddHard && entriesPausedUntil < slot) entriesPausedUntil = slot + 600;
+      if (drawdown > params.ddHard && entriesPausedUntil < slot) entriesPausedUntil = slot + DD_PAUSE_SLOTS;
       const stakeScale = drawdown > params.ddSoft ? 0.5 : 1;
 
       // ---- exits first: they free slots and lock in the equity steps ------
@@ -342,7 +351,7 @@ export function createStrategy(params: Params): Bot {
           if (trend !== null && trend.netSol < params.trendBreakNetSol && ratio < 1.02) exit = true;
         }
         if (exit) {
-          orders.push({ side: 'sell', mint, token_amount: h.token_amount, max_slippage_bps: 10_000 });
+          orders.push({ side: 'sell', mint, token_amount: h.token_amount, max_slippage_bps: BPS_WHOLE });
           sellPending.add(mint);
           spend(0n);
         }
@@ -401,7 +410,7 @@ export function createStrategy(params: Params): Bot {
             : clamp(params.baseStakeSol * (params.volTarget / Math.max(stats.vol, 0.01)), params.minStakeSol, params.maxStakeSol) * stakeScale;
           let stake = solToLamports(stakeSol);
           if (stake > cap) stake = cap;
-          if (stake < solToLamports(0.012)) continue; // under the round-trip floor: not worth a slot
+          if (stake < solToLamports(MIN_BUY_SOL)) continue; // under the round-trip floor: not worth a slot
           if (openCost + stake > solToLamports(params.maxExposureSol)) continue;
           if (free < stake + txFee + solToLamports(params.cashBufferSol)) continue;
           orders.push({ side: 'buy', mint, quote_lamports: stake, max_slippage_bps: params.buySlipBps });
