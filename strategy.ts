@@ -1,430 +1,555 @@
-// Trend-and-dip rotation strategy for the pump.fun bonding-curve replay
-// (agent-fun/replay/v2), written for the "Pump.fun Sharpe Sprint" bounty.
+// Ignition-scalp bot for the Pump.fun Sharpe Sprint — Cleanest Paper Bot Wins.
 //
-// The contest ranks by HOURLY SHARPE, not by raw PnL, and only pays when net
-// PnL beats holding cash. Local backtests on the kit's dev window taught the
-// design its shape (see README): short-window momentum entries on pump.fun
-// mostly buy the local top — the tape confirms the move only once it is
-// already over, and the position stops out within seconds, paying the
-// ~1.25% curve fees and the fixed transaction fee for nothing. What held up
-// instead was patience: curves with a sustained, minutes-long grind of net
-// inflow, entered on a small pullback rather than at the high.
+// Idea, built from the competition brief alone: most pump.fun curves die
+// within minutes, but the minority that attract real money early keep
+// drifting up for a while as new buyers pile in. This bot only buys curves
+// that have already proven sponsorship — a deep real SOL reserve, a clear
+// buy majority, several distinct buyers, real net inflow — and then scalps
+// a small slice of the next leg up, exiting on written rules within
+// minutes. It never chases a spike, never averages down, never holds a
+// dead coin, and never touches a curve that has already completed.
 //
-// So the entry has two halves, both required:
-//   1. An established trend over a long window: net SOL flowing in, buy-side
-//      flow dominating, many distinct buyers, price up but not vertical,
-//      realised volatility low enough that a round trip clears fees.
-//   2. A short-term dip inside that trend: the price sits a few percent
-//      below the trend window's high and the bleeding has stopped (recent
-//      net flow no longer negative). We buy the dip in a live trend, never
-//      the spike and never a falling knife.
+// One lesson is baked into the entry path: the batch that pushes a curve
+// over the sponsorship bar is usually a burst of buys at a local top, so
+// the bot never buys the burst itself. It waits for the pullback — the
+// price must retrace 13–30% below its observed peak while sponsorship
+// still holds — and only then takes a position. (An optional confirmation
+// watch — observe a qualifying curve for a while before buying — is kept
+// in the code but disabled by default: in testing it let too many good
+// entries run away.)
 //
-// Positions are sized by volatility (wild tapes get probe size or none) and
-// sold whole on a written rule: take-profit, stop-loss, a trailing stop once
-// the position has earned it, a trend-break exit, and a hard time stop.
-// Selling whole in many small, similar steps is what an hourly Sharpe ratio
-// rewards. A pacing mode takes small, fast probe trades if the count of
-// finished round trips over distinct mints falls behind the 20-mint
-// guardrail bar, and a drawdown brake halves stakes — then pauses entries —
-// when equity falls below its peak: protecting the Sharpe denominator is
-// the strategy.
-//
-// Deterministic by construction: no clock, no randomness, no iteration
-// over anything but insertion-ordered maps fed by the batch stream, so
-// the grader's two executions produce byte-identical action logs.
+// Sharpe, not PnL, is the ranking metric, so the bot optimises for many
+// small, similar, low-variance round trips: small stakes, tight exits, a
+// pacing mode that guarantees the 20-distinct-mint bar, and a drawdown
+// brake. Every decision is a pure function of the batches the harness
+// delivers — no clock, no environment, no randomness — so the two grading
+// executions agree byte for byte.
 
-import type { Batch, Bot, BotState, OrderInput, Pubkey } from './vendor/makefun-bot.ts';
+import {
+  LAMPORTS_PER_SOL,
+  type Batch,
+  type Bot,
+  type BotState,
+  type Done,
+} from './vendor/makefun-bot.ts';
 
-const SOL = 1_000_000_000;
-
-/** Basis points in a whole. Fee math divides by this, and a sell's slippage
- *  tolerance is set to all of it: an exit must land, never strand. */
-const BPS_WHOLE = 10_000;
-/** Smallest buy worth sending, in SOL: below the ~0.01 SOL round-trip fee
- *  floor a trade cannot pay for itself, so it is not worth a slot. */
-const MIN_BUY_SOL = 0.012;
-/** Slots entries stay paused after a hard-drawdown breach. */
-const DD_PAUSE_SLOTS = 600;
+// ---------------------------------------------------------------- parameters
 
 export interface Params {
-  /** Long window the trend is judged over, in slots. */
-  trendWindow: number;
-  /** Short window the dip is judged over, in slots. */
-  dipWindow: number;
-  /** Slots after the CreateEvent before a curve may be entered. */
-  minAgeSlots: number;
-  /** Minimum trades inside the trend window. */
+  // Entry: a curve must look sponsored before we touch it.
   minTrades: number;
-  /** Minimum distinct buying wallets inside the trend window. */
+  minBuyShareBps: number;
   minBuyers: number;
-  /** Buy SOL must be at least this share of trend-window volume. */
-  minBuyShare: number;
-  /** Net SOL inflow (buys minus sells) inside the trend window, in SOL. */
-  minNetSol: number;
-  /** Trend-window price change must sit inside [momMin, momMax]. */
-  momMin: number;
-  momMax: number;
-  /** RMS per-trade log return inside the trend window may not exceed this. */
-  maxVol: number;
-  /** No single trade inside the trend window may move the price more than this. */
-  maxJump: number;
-  /** Largest single buy may not exceed this share of trend-window buy SOL. */
-  maxWhaleShare: number;
-  /** The dip: last price must sit [dipMin, dipMax] below the trend window's high ... */
-  dipMin: number;
-  dipMax: number;
-  /** ... and net SOL flow over the dip window must be at least dipFlowMinSol (bleeding stopped). */
-  dipFlowMinSol: number;
-  /** Real SOL reserves at entry must sit inside [rqMinSol, rqMaxSol]. */
-  rqMinSol: number;
-  rqMaxSol: number;
-  /** Stake sizing: base stake, volatility target and clamps, in SOL. */
+  minRealReserveSol: number;
+  minNetInflowSol: number;
+  minRiseBps: number;
+  maxRiseBps: number;
+  maxJumpBps: number;
+  maxAgeSlots: number;
+  // Confirmation watch: a qualifying curve is observed before it is bought.
+  // Negative delay disables the watch (buy on first qualifying touch).
+  confirmDelaySlots: number;
+  confirmMaxDropBps: number;
+  confirmWindowSlots: number;
+  // Dip entry: buy the pullback, not the burst — the price must have
+  // retraced into a band below its observed peak while the overall rise
+  // from the first print is still intact. dipMinBps 0 disables the band.
+  dipMinBps: number;
+  dipMaxBps: number;
+  // Sizing (SOL).
   baseStakeSol: number;
-  volTarget: number;
   minStakeSol: number;
   maxStakeSol: number;
-  /** Buy slippage tolerance (bps). Sells always use 10_000: an exit must land. */
-  buySlipBps: number;
-  /** Exits: sell whole when value reaches cost * (1 + takeProfit) ... */
-  takeProfit: number;
-  /** ... or falls to cost * (1 - stopLoss) ... */
-  stopLoss: number;
-  /** ... or, once value has reached cost * (1 + trailArm), falls trailDrop below its peak ... */
-  trailArm: number;
-  trailDrop: number;
-  /** ... or the trend breaks: net flow over the trend window turns below trendBreakNetSol while not clearly winning ... */
-  trendBreakNetSol: number;
-  /** ... or after maxHoldSlots, unless the position is up holdExtendIfUp or more (then only the trail applies). */
-  maxHoldSlots: number;
-  holdExtendIfUp: number;
-  /** Slots before the same mint may be entered again, and the most entries per mint per run. */
-  cooldownSlots: number;
-  maxEntriesPerMint: number;
-  /** Most SOL at cost across all open positions at once. */
-  maxExposureSol: number;
-  /** Cash (SOL) never spent: kept back for exit fees and late opportunities. */
+  // Exits (bps against the entry price, slots against the fill slot).
+  takeProfitBps: number;
+  stopLossBps: number;
+  trailArmBps: number;
+  trailGapBps: number;
+  timeStopSlots: number;
+  quietExitSlots: number;
+  // Order tolerance.
+  buySlippageBps: number;
+  sellSlippageBps: number;
+  // Risk.
   cashBufferSol: number;
-  /** Drawdown brakes: past ddSoft stakes halve; past ddHard entries pause. */
-  ddSoft: number;
-  ddHard: number;
-  /** Pacing: distinct mints that must finish a round trip; probe trades keep the count honest. */
-  targetMints: number;
-  probeStakeSol: number;
+  maxPositions: number;
+  maxBuysPerBatch: number;
+  // Pacing: relaxed entry once the 20-mint bar looks at risk.
+  relaxedBuyShareBps: number;
+  relaxedInflowSol: number;
+  relaxedMinTrades: number;
+  relaxedMinBuyers: number;
+  relaxedMinReserveSol: number;
+  relaxedDipMinBps: number;
+  relaxedStakeSol: number;
+  relaxAfterMints: number;
+  relaxAfterSlots: number;
+  // Drawdown brake (bps of equity off its peak).
+  ddHalveBps: number;
+  ddPauseBps: number;
 }
 
-/** The settings main.ts trades with. Chosen on the dev window for flat, robust behaviour over a single best cell. */
 export const DEFAULT_PARAMS: Params = {
-  trendWindow: 240,
-  dipWindow: 20,
-  minAgeSlots: 120,
-  minTrades: 40,
-  minBuyers: 10,
-  minBuyShare: 0.55,
-  minNetSol: 2,
-  momMin: 0.05,
-  momMax: 0.8,
-  maxVol: 0.06,
-  maxJump: 0.35,
-  maxWhaleShare: 0.4,
-  dipMin: 0.02,
-  dipMax: 0.12,
-  dipFlowMinSol: -0.2,
-  rqMinSol: 10,
-  rqMaxSol: 90,
-  baseStakeSol: 0.05,
-  volTarget: 0.045,
+  minTrades: 20,
+  minBuyShareBps: 7500,
+  minBuyers: 8,
+  minRealReserveSol: 3.5,
+  minNetInflowSol: 1.0,
+  minRiseBps: 300,
+  maxRiseBps: 2500,
+  maxJumpBps: 2500,
+  maxAgeSlots: 3000,
+  confirmDelaySlots: -1,
+  confirmMaxDropBps: 500,
+  confirmWindowSlots: 900,
+  dipMinBps: 1300,
+  dipMaxBps: 3000,
+  baseStakeSol: 0.03,
   minStakeSol: 0.02,
-  maxStakeSol: 0.09,
-  buySlipBps: 1500,
-  takeProfit: 0.25,
-  stopLoss: 0.12,
-  trailArm: 0.12,
-  trailDrop: 0.09,
-  trendBreakNetSol: -1,
-  maxHoldSlots: 900,
-  holdExtendIfUp: 0.3,
-  cooldownSlots: 300,
-  maxEntriesPerMint: 3,
-  maxExposureSol: 1.2,
-  cashBufferSol: 0.5,
-  ddSoft: 0.12,
-  ddHard: 0.22,
-  targetMints: 20,
-  probeStakeSol: 0.025,
+  maxStakeSol: 0.06,
+  takeProfitBps: 1200,
+  stopLossBps: 1200,
+  trailArmBps: 800,
+  trailGapBps: 800,
+  timeStopSlots: 1500,
+  quietExitSlots: 600,
+  buySlippageBps: 500,
+  sellSlippageBps: 1000,
+  cashBufferSol: 1.0,
+  maxPositions: 5,
+  maxBuysPerBatch: 3,
+  relaxedBuyShareBps: 6000,
+  relaxedInflowSol: 0.2,
+  relaxedMinTrades: 12,
+  relaxedMinBuyers: 5,
+  relaxedMinReserveSol: 1.5,
+  relaxedDipMinBps: 1300,
+  relaxedStakeSol: 0.012,
+  relaxAfterMints: 400,
+  relaxAfterSlots: 150000,
+  ddHalveBps: 1000,
+  ddPauseBps: 2000,
 };
 
-/** One recorded trade on a curve's tape. Price is virtual quote per token after the trade. */
-interface TapeTrade {
-  slot: number;
-  price: number;
-  /** Signed SOL: positive for a buy, negative for a sell. */
-  sol: number;
-  buy: boolean;
-  user: Pubkey;
+// ---------------------------------------------------------------- helpers
+
+const LAMPORTS_PER_SOL_NUM = 1_000_000_000;
+
+/** SOL per token from virtual reserves (0 when the curve has no quote). */
+function priceOf(virtualQuote: bigint, virtualToken: bigint): number {
+  if (virtualToken <= 0n || virtualQuote <= 0n) return 0;
+  return Number(virtualQuote) / Number(virtualToken);
 }
 
-/** Per-mint rolling state, fed only by the batch stream. */
-interface MintBook {
-  tape: TapeTrade[];
-  entries: number;
-  lastExitSlot: number;
-  /** Highest estimated net value of the current position, in lamports. */
-  peakValue: bigint;
-  entrySlot: number;
+/** Change from `from` to `to` in basis points (0 when `from` is not positive). */
+function changeBps(from: number, to: number): number {
+  if (from <= 0 || to <= 0) return 0;
+  return ((to - from) / from) * 10000;
 }
 
-interface WindowStats {
-  trades: number;
-  buyers: number;
-  buyShare: number;
-  netSol: number;
-  momentum: number;
-  vol: number;
-  maxJump: number;
-  whaleShare: number;
+function clamp(n: number, lo: number, hi: number): number {
+  return n < lo ? lo : n > hi ? hi : n;
+}
+
+// ---------------------------------------------------------------- per-mint book
+
+interface MintTrack {
+  mint: string;
+  createdSlot: number;
+  firstSeenSlot: number;
+  firstPrice: number;
   lastPrice: number;
-  highPrice: number;
+  prevPrice: number;
+  trades: number;
+  buys: number;
+  buyers: Set<string>;
+  netInflowLamports: bigint;
+  realReserveLamports: bigint;
+  maxJumpBps: number;
+  lastTradeSlot: number;
+  complete: boolean;
+  // Confirmation watch (meaningful only while not holding).
+  confirmSlot: number;
+  confirmPrice: number;
+  // Highest price ever printed for this mint (drives the dip band).
+  peakPriceSeen: number;
+  // Position book (meaningful only while we hold the mint).
+  holding: boolean;
+  entryPrice: number;
+  entrySlot: number;
+  peakPrice: number;
+  trailArmed: boolean;
+  // Exit bookkeeping: how the last round trip on this mint ended.
+  lastExit: '' | 'profit' | 'stop' | 'trail' | 'time' | 'quiet' | 'closed';
+  trips: number;
 }
 
-const clamp = (x: number, lo: number, hi: number) => (x < lo ? lo : x > hi ? hi : x);
-const solToLamports = (sol: number) => BigInt(Math.round(sol * SOL));
+function newTrack(mint: string, slot: number, price: number): MintTrack {
+  return {
+    mint,
+    createdSlot: slot,
+    firstSeenSlot: slot,
+    firstPrice: price,
+    lastPrice: price,
+    prevPrice: price,
+    trades: 0,
+    buys: 0,
+    buyers: new Set<string>(),
+    netInflowLamports: 0n,
+    realReserveLamports: 0n,
+    maxJumpBps: 0,
+    lastTradeSlot: slot,
+    complete: false,
+    confirmSlot: -1,
+    confirmPrice: 0,
+    peakPriceSeen: price,
+    holding: false,
+    entryPrice: 0,
+    entrySlot: 0,
+    peakPrice: 0,
+    trailArmed: false,
+    lastExit: '',
+    trips: 0,
+  };
+}
+
+// ---------------------------------------------------------------- strategy
 
 export function createStrategy(params: Params): Bot {
-  const books = new Map<Pubkey, MintBook>();
-  /** Mints we have ever bought (a filled buy was seen). */
-  const boughtMints = new Set<Pubkey>();
-  /** Mints with a completed round trip (a filled sell after our buy). */
-  const roundTrippedMints = new Set<Pubkey>();
-  /** Mints with one of our sells already in flight: never send a second. */
-  const sellPending = new Set<Pubkey>();
+  const p = params;
+  const tracks = new Map<string, MintTrack>();
+  let tripsDone = 0;
+  const mintsTraded = new Set<string>();
+  let freshSeen = 0;
   let firstSlot = -1;
-  let peakEquity = 0n;
-  let entriesPausedUntil = -1;
+  let batchesSeen = 0;
+  let peakEquityLamports = 0n;
+  let buysSent = 0;
+  let sellsSent = 0;
 
-  const bookFor = (mint: Pubkey): MintBook => {
-    let b = books.get(mint);
-    if (b === undefined) {
-      b = { tape: [], entries: 0, lastExitSlot: -1, peakValue: 0n, entrySlot: -1 };
-      books.set(mint, b);
-    }
-    return b;
-  };
-
-  /** Estimated net SOL (lamports) a full sell of `tokens` on this curve returns now, fees estimated at the fallback rates. */
-  const sellValueLamports = (state: BotState, mint: Pubkey, tokens: bigint): bigint => {
-    const c = state.curves.get(mint);
-    if (c === undefined || tokens <= 0n) return 0n;
-    const gross = (tokens * c.virtual_quote_reserves) / (c.virtual_token_reserves + tokens);
-    const feeBps = BigInt(state.hello.fees.protocol_bps_fallback + state.hello.fees.creator_bps_fallback);
-    return gross - (gross * feeBps) / BigInt(BPS_WHOLE);
-  };
-
-  /** Window statistics for one mint, or null when the tape is too thin to judge. */
-  const windowStats = (book: MintBook, slot: number, windowSlots: number): WindowStats | null => {
-    const from = slot - windowSlots;
-    const tape = book.tape.filter((t) => t.slot > from);
-    if (tape.length < 2) return null;
-    let buySol = 0;
-    let sellSol = 0;
-    let maxBuy = 0;
-    let sqReturns = 0;
-    let maxJump = 0;
-    let highPrice = 0;
-    const buyers = new Set<Pubkey>();
-    for (let i = 0; i < tape.length; i++) {
-      const t = tape[i];
-      if (t.price > highPrice) highPrice = t.price;
-      if (t.buy) {
-        buySol += t.sol;
-        if (t.sol > maxBuy) maxBuy = t.sol;
-        buyers.add(t.user);
-      } else {
-        sellSol -= t.sol;
-      }
-      if (i > 0) {
-        const r = Math.log(t.price / tape[i - 1].price);
-        sqReturns += r * r;
-        const j = Math.abs(Math.exp(r) - 1);
-        if (j > maxJump) maxJump = j;
+  /** Mark-to-market equity: cash plus positions at their last known price. */
+  function equityLamports(state: BotState): bigint {
+    let equity = state.cash;
+    for (const [mint, holding] of state.positions) {
+      const curve = state.curves.get(mint);
+      const track = tracks.get(mint);
+      const price = curve !== undefined
+        ? priceOf(curve.virtual_quote_reserves, curve.virtual_token_reserves)
+        : track !== undefined
+          ? track.lastPrice
+          : 0;
+      if (price > 0) {
+        // price is lamports per token; tokens * price is lamports.
+        const value = BigInt(Math.floor(Number(holding.token_amount) * price));
+        equity += value;
       }
     }
-    const total = buySol + sellSol;
-    if (total <= 0) return null;
-    return {
-      trades: tape.length,
-      buyers: buyers.size,
-      buyShare: buySol / total,
-      netSol: buySol - sellSol,
-      momentum: tape[tape.length - 1].price / tape[0].price - 1,
-      vol: Math.sqrt(sqReturns / (tape.length - 1)),
-      maxJump,
-      whaleShare: buySol > 0 ? maxBuy / buySol : 1,
-      lastPrice: tape[tape.length - 1].price,
-      highPrice,
-    };
-  };
+    return equity;
+  }
 
-  /** How far behind the 20-mint pace we are: 0 = on pace, 1..3 = progressively more permissive probes. */
-  const paceLevel = (slot: number): number => {
-    if (roundTrippedMints.size >= params.targetMints || firstSlot < 0) return 0;
-    const elapsed = slot - firstSlot;
-    // A 6-hour window is roughly 54k slots. Every ~9k slots without the bar
-    // in sight, the probe bar drops a notch; probes stay small and exit fast.
-    return clamp(Math.floor(elapsed / 9000), 0, 3);
-  };
+  function relaxedMode(state: BotState): boolean {
+    // The bar is 20 distinct mints traded, so pace against the distinct
+    // count — repeat trips on the same mint do not advance the bar.
+    if (mintsTraded.size >= 20) return false;
+    if (freshSeen > p.relaxAfterMints) return true;
+    if (firstSlot >= 0 && state.slot - firstSlot > p.relaxAfterSlots) return true;
+    return false;
+  }
+
+  /** Does this curve qualify for a fresh buy right now? */
+  function qualifies(track: MintTrack, relaxed: boolean): boolean {
+    if (track.complete || track.holding) return false;
+    if (track.lastExit === 'stop' || track.lastExit === 'trail') return false;
+    const age = track.lastTradeSlot - track.createdSlot;
+    if (age > p.maxAgeSlots && !relaxed) return false;
+    const minTrades = relaxed ? p.relaxedMinTrades : p.minTrades;
+    const minBuyers = relaxed ? p.relaxedMinBuyers : p.minBuyers;
+    const minShare = relaxed ? p.relaxedBuyShareBps : p.minBuyShareBps;
+    const minInflow = relaxed ? p.relaxedInflowSol : p.minNetInflowSol;
+    if (track.trades < minTrades) return false;
+    if (track.buyers.size < minBuyers) return false;
+    if (track.trades > 0 && (track.buys * 10000) / track.trades < minShare) return false;
+    if (Number(track.netInflowLamports) < minInflow * LAMPORTS_PER_SOL_NUM) return false;
+    const minReserve = relaxed ? p.relaxedMinReserveSol : p.minRealReserveSol;
+    if (Number(track.realReserveLamports) < minReserve * LAMPORTS_PER_SOL_NUM) return false;
+    const rise = changeBps(track.firstPrice, track.lastPrice);
+    if (rise < p.minRiseBps) return false;
+    if (!relaxed && rise > p.maxRiseBps) return false;
+    if (!relaxed && track.maxJumpBps > p.maxJumpBps) return false;
+    // Dip band: the current print must sit below the observed peak — deep
+    // enough that the burst is over, shallow enough that the curve is not
+    // simply collapsing. Pacing mode uses its own (usually looser) band.
+    const dipMin = relaxed ? p.relaxedDipMinBps : p.dipMinBps;
+    if (dipMin > 0 && track.peakPriceSeen > 0) {
+      const retrace = changeBps(track.peakPriceSeen, track.lastPrice);
+      if (retrace > -dipMin) return false;
+      if (retrace < -p.dipMaxBps) return false;
+    }
+    return true;
+  }
+
+  /** Stake for this curve in lamports, before the harness size cap. */
+  function stakeLamports(track: MintTrack, relaxed: boolean, stakeScale: number): bigint {
+    const inflowSol = Number(track.netInflowLamports) / LAMPORTS_PER_SOL_NUM;
+    const base = relaxed ? p.relaxedStakeSol : p.baseStakeSol;
+    const want = relaxed
+      ? p.relaxedStakeSol
+      : clamp(base * (0.5 + inflowSol), p.minStakeSol, p.maxStakeSol);
+    return BigInt(Math.floor(want * stakeScale * LAMPORTS_PER_SOL_NUM));
+  }
 
   return {
-    onBatch(state: BotState, batch: Batch): OrderInput[] {
-      const slot = batch.slot;
-      if (firstSlot < 0) firstSlot = slot;
-      const caps = state.hello.caps;
-      const txFee = state.txFeeLamports();
+    onHello(state: BotState): void {
+      peakEquityLamports = state.cash;
+      firstSlot = -1;
+      console.error(
+        `[sharpe] hello seed=${state.hello.seed} capital=${state.cash} ` +
+          `stake=${p.baseStakeSol} tp=${p.takeProfitBps}bps sl=${p.stopLossBps}bps`,
+      );
+    },
 
-      // ---- fold the batch into the books ----------------------------------
-      for (const f of batch.fills) {
-        if (f.side === 'sell') sellPending.delete(f.mint);
-        if (f.status !== 'filled') continue;
-        if (f.side === 'buy') boughtMints.add(f.mint);
-        if (f.side === 'sell') {
-          if (boughtMints.has(f.mint)) roundTrippedMints.add(f.mint);
-          const b = books.get(f.mint);
-          if (b !== undefined) {
-            b.lastExitSlot = slot;
-            b.peakValue = 0n;
-            b.entrySlot = -1;
+    onBatch(state: BotState, batch: Batch) {
+      batchesSeen += 1;
+      if (firstSlot < 0) firstSlot = state.slot;
+      const orders: Array<{
+        side: 'buy' | 'sell';
+        mint: string;
+        quote_lamports?: bigint;
+        token_amount?: bigint;
+        max_slippage_bps: number;
+      }> = [];
+
+      // --- 1. Fold this batch's fills into the books.
+      for (const fill of batch.fills) {
+        if (fill.status !== 'filled') continue;
+        const track = tracks.get(fill.mint);
+        if (fill.side === 'buy' && track !== undefined) {
+          const tokens = BigInt(fill.token_amount);
+          const paid = BigInt(fill.quote_lamports);
+          track.holding = true;
+          track.confirmSlot = -1;
+          track.confirmPrice = 0;
+          track.entryPrice = tokens > 0n ? Number(paid) / Number(tokens) : track.lastPrice;
+          track.entrySlot = fill.slot;
+          track.peakPrice = track.entryPrice;
+          track.trailArmed = false;
+        } else if (fill.side === 'sell' && track !== undefined) {
+          if (track.holding) {
+            track.holding = false;
+            track.trips += 1;
+            tripsDone += 1;
+            mintsTraded.add(fill.mint);
           }
         }
       }
-      for (const e of batch.events) {
-        if (e.event !== 'TradeEvent') continue;
-        const book = bookFor(e.mint);
-        const vq = Number(e.virtual_quote_reserves);
-        const vt = Number(e.virtual_token_reserves);
-        if (vt <= 0) continue;
-        const sol = Number(e.sol_amount) / SOL;
-        book.tape.push({ slot: e.slot, price: vq / vt, sol: e.is_buy ? sol : -sol, buy: e.is_buy, user: e.user });
-        // Keep the tape bounded: drop trades far outside any window we read.
-        const horizon = slot - params.trendWindow - 5;
-        let cut = 0;
-        while (cut < book.tape.length && book.tape[cut].slot <= horizon) cut++;
-        if (cut > 0) book.tape.splice(0, cut);
+
+      // --- 2. Fold this batch's events into the per-mint tracks.
+      const candidates: MintTrack[] = [];
+      for (const event of batch.events) {
+        if (event.event === 'CreateEvent') {
+          freshSeen += 1;
+          let track = tracks.get(event.mint);
+          if (track === undefined) {
+            track = newTrack(
+              event.mint,
+              event.slot,
+              priceOf(BigInt(event.virtual_quote_reserves), BigInt(event.virtual_token_reserves)),
+            );
+            tracks.set(event.mint, track);
+          }
+          candidates.push(track);
+        } else if (event.event === 'TradeEvent') {
+          let track = tracks.get(event.mint);
+          if (track === undefined) {
+            track = newTrack(event.mint, event.slot, 0);
+            tracks.set(event.mint, track);
+          }
+          const price = priceOf(BigInt(event.virtual_quote_reserves), BigInt(event.virtual_token_reserves));
+          if (track.firstPrice <= 0 && price > 0) track.firstPrice = price;
+          if (track.lastPrice > 0 && price > 0) {
+            const jump = Math.abs(changeBps(track.lastPrice, price));
+            if (jump > track.maxJumpBps) track.maxJumpBps = jump;
+          }
+          track.prevPrice = track.lastPrice;
+          if (price > 0) {
+            track.lastPrice = price;
+            if (price > track.peakPriceSeen) track.peakPriceSeen = price;
+          }
+          track.trades += 1;
+          if (event.is_buy) {
+            track.buys += 1;
+            track.buyers.add(event.user);
+            track.netInflowLamports += BigInt(event.sol_amount);
+          } else {
+            track.netInflowLamports -= BigInt(event.sol_amount);
+          }
+          track.realReserveLamports = BigInt(event.real_quote_reserves);
+          track.lastTradeSlot = event.slot;
+          candidates.push(track);
+        } else {
+          // CompleteEvent: the curve is done; the harness closes our position.
+          const track = tracks.get(event.mint);
+          if (track !== undefined) {
+            track.complete = true;
+            if (track.holding) {
+              track.holding = false;
+              track.lastExit = 'closed';
+            }
+          }
+        }
       }
 
-      const orders: OrderInput[] = [];
-      let free = state.freeCashLamports();
-      const spend = (amount: bigint) => {
-        free -= amount + txFee;
-      };
-
-      // ---- equity and the drawdown brake ----------------------------------
-      let equity = state.cash;
-      let openCost = 0n;
-      for (const [mint, h] of state.positions) {
-        equity += sellValueLamports(state, mint, h.token_amount);
-        openCost += h.cost_lamports;
+      // Marks refresh the price of mints we hold or have pending orders in.
+      for (const mark of batch.marks) {
+        const track = tracks.get(mark.mint);
+        if (track === undefined) continue;
+        const price = priceOf(BigInt(mark.virtual_quote_reserves), BigInt(mark.virtual_token_reserves));
+        if (price > 0) {
+          track.lastPrice = price;
+          if (price > track.peakPriceSeen) track.peakPriceSeen = price;
+        }
+        track.realReserveLamports = BigInt(mark.real_quote_reserves);
       }
-      if (equity > peakEquity) peakEquity = equity;
-      const drawdown = peakEquity > 0n ? Number(peakEquity - equity) / Number(peakEquity) : 0;
-      if (drawdown > params.ddHard && entriesPausedUntil < slot) entriesPausedUntil = slot + DD_PAUSE_SLOTS;
-      const stakeScale = drawdown > params.ddSoft ? 0.5 : 1;
 
-      // ---- exits first: they free slots and lock in the equity steps ------
-      for (const [mint, h] of state.positions) {
-        if (orders.length >= caps.max_orders_per_batch) break;
-        if (sellPending.has(mint)) continue;
+      // --- 3. Exits first: every held position is judged against written rules.
+      const pendingSell = new Set<string>();
+      for (const pending of state.pending.values()) {
+        if (pending.order.side === 'sell') pendingSell.add(pending.order.mint);
+      }
+      for (const [mint, holding] of state.positions) {
+        if (pendingSell.has(mint)) continue;
+        const track = tracks.get(mint);
         const curve = state.curves.get(mint);
-        if (curve === undefined || curve.complete) continue; // the replay closes completed curves itself
-        const book = bookFor(mint);
-        if (book.entrySlot < 0) book.entrySlot = slot;
-        const value = sellValueLamports(state, mint, h.token_amount);
-        if (value > book.peakValue) book.peakValue = value;
-        const cost = h.cost_lamports;
-        const ratio = cost > 0n ? Number(value) / Number(cost) : 1;
-        const peakRatio = cost > 0n ? Number(book.peakValue) / Number(cost) : 1;
-        let exit = false;
-        if (ratio >= 1 + params.takeProfit) exit = true;
-        else if (ratio <= 1 - params.stopLoss) exit = true;
-        else if (peakRatio >= 1 + params.trailArm && Number(value) <= Number(book.peakValue) * (1 - params.trailDrop)) exit = true;
-        else if (slot - book.entrySlot >= params.maxHoldSlots && ratio < 1 + params.holdExtendIfUp) exit = true;
-        else {
-          const trend = windowStats(book, slot, params.trendWindow);
-          if (trend !== null && trend.netSol < params.trendBreakNetSol && ratio < 1.02) exit = true;
+        const price = curve !== undefined
+          ? priceOf(curve.virtual_quote_reserves, curve.virtual_token_reserves)
+          : track !== undefined
+            ? track.lastPrice
+            : 0;
+        if (price <= 0 || track === undefined) continue;
+        if (!track.holding) {
+          // Position exists but we missed its buy fill: adopt it at cost.
+          track.holding = true;
+          track.entryPrice = holding.token_amount > 0n
+            ? Number(holding.cost_lamports) / Number(holding.token_amount)
+            : price;
+          track.entrySlot = state.slot;
+          track.peakPrice = track.entryPrice;
+          track.trailArmed = false;
         }
-        if (exit) {
-          orders.push({ side: 'sell', mint, token_amount: h.token_amount, max_slippage_bps: BPS_WHOLE });
-          sellPending.add(mint);
-          spend(0n);
+        if (price > track.peakPrice) track.peakPrice = price;
+        const move = changeBps(track.entryPrice, price);
+        let exitKind: '' | 'profit' | 'stop' | 'trail' | 'time' | 'quiet' = '';
+        if (move >= p.takeProfitBps) exitKind = 'profit';
+        else if (move <= -p.stopLossBps) exitKind = 'stop';
+        else {
+          if (move >= p.trailArmBps) track.trailArmed = true;
+          if (track.trailArmed && changeBps(track.peakPrice, price) <= -p.trailGapBps) {
+            exitKind = 'trail';
+          } else if (state.slot - track.entrySlot > p.timeStopSlots) {
+            exitKind = 'time';
+          } else if (state.slot - track.lastTradeSlot > p.quietExitSlots) {
+            exitKind = 'quiet';
+          }
+        }
+        if (exitKind !== '') {
+          track.lastExit = exitKind;
+          orders.push({
+            side: 'sell',
+            mint,
+            token_amount: holding.token_amount,
+            max_slippage_bps: p.sellSlippageBps,
+          });
+          sellsSent += 1;
         }
       }
 
-      // ---- entries ---------------------------------------------------------
-      const pace = paceLevel(slot);
-      const paused = slot < entriesPausedUntil;
-      if (!paused && state.committedPositionCount() < caps.max_open_positions) {
-        // Candidates: mints with fresh tape activity, best trend inflow first.
-        const active = new Set<Pubkey>();
-        for (const e of batch.events) active.add(e.mint);
-        const scored: { mint: Pubkey; stats: WindowStats; probe: boolean }[] = [];
-        for (const mint of active) {
-          const curve = state.curves.get(mint);
-          if (curve === undefined || curve.complete) continue;
-          if (state.positions.has(mint)) continue;
-          if (curve.created_slot === null || slot - curve.created_slot < params.minAgeSlots) continue;
-          const rqSol = Number(curve.real_quote_reserves) / SOL;
-          if (rqSol < params.rqMinSol || rqSol > params.rqMaxSol) continue;
-          const book = bookFor(mint);
-          if (book.entries >= params.maxEntriesPerMint) continue;
-          if (book.lastExitSlot >= 0 && slot - book.lastExitSlot < params.cooldownSlots) continue;
-          const trend = windowStats(book, slot, params.trendWindow);
-          if (trend === null) continue;
-          const dip = windowStats(book, slot, params.dipWindow);
-          if (dip === null) continue;
-          const dipDepth = trend.highPrice > 0 ? 1 - trend.lastPrice / trend.highPrice : 0;
-          const relax = pace > 0;
-          const trendOk =
-            trend.trades >= (relax ? 12 : params.minTrades) &&
-            trend.buyers >= (relax ? 5 : params.minBuyers) &&
-            trend.buyShare >= (relax ? 0.52 : params.minBuyShare) &&
-            trend.netSol >= (relax ? 0.6 : params.minNetSol) &&
-            trend.momentum >= (relax ? 0.01 : params.momMin) &&
-            trend.momentum <= (relax ? 1.2 : params.momMax) &&
-            trend.vol <= (relax ? 0.1 : params.maxVol) &&
-            trend.maxJump <= params.maxJump &&
-            trend.whaleShare <= params.maxWhaleShare;
-          if (!trendOk) continue;
-          // The dip half: below the trend high, bleeding stopped. Probes may
-          // skip the dip once pacing is desperate (level >= 2): they exist to
-          // bank round trips, sized small and exited by the same rules.
-          const dipOk = (dipDepth >= params.dipMin && dipDepth <= params.dipMax && dip.netSol >= params.dipFlowMinSol) || pace >= 2;
-          if (!dipOk) continue;
-          scored.push({ mint, stats: trend, probe: relax });
+      // --- 4. Entries: buy sponsored curves, smallest-first, within the caps.
+      const equity = equityLamports(state);
+      if (equity > peakEquityLamports) peakEquityLamports = equity;
+      const drawdownBps = peakEquityLamports > 0n
+        ? Number(((peakEquityLamports - equity) * 10000n) / peakEquityLamports)
+        : 0;
+      const paused = drawdownBps >= p.ddPauseBps;
+      const stakeScale = drawdownBps >= p.ddHalveBps ? 0.5 : 1;
+      const relaxed = relaxedMode(state);
+      if (!paused && state.committedPositionCount() < p.maxPositions) {
+        const pendingBuy = new Set<string>();
+        for (const pending of state.pending.values()) {
+          if (pending.order.side === 'buy') pendingBuy.add(pending.order.mint);
         }
-        scored.sort((a, b) => b.stats.netSol - a.stats.netSol || (a.mint < b.mint ? -1 : 1));
-
-        let slots = caps.max_open_positions - state.committedPositionCount();
-        for (const { mint, stats, probe } of scored) {
-          if (orders.length >= caps.max_orders_per_batch || slots <= 0) break;
-          const cap = state.maxBuyLamports(mint);
-          const stakeSol = probe
-            ? params.probeStakeSol
-            : clamp(params.baseStakeSol * (params.volTarget / Math.max(stats.vol, 0.01)), params.minStakeSol, params.maxStakeSol) * stakeScale;
-          let stake = solToLamports(stakeSol);
+        let buysThisBatch = 0;
+        // Candidates are the mints this batch touched, in event order; a
+        // curve only gets one decision per batch.
+        const seenThisBatch = new Set<string>();
+        for (const track of candidates) {
+          if (buysThisBatch >= p.maxBuysPerBatch) break;
+          if (seenThisBatch.has(track.mint)) continue;
+          seenThisBatch.add(track.mint);
+          if (state.positions.has(track.mint)) continue;
+          if (pendingBuy.has(track.mint)) continue;
+          if (state.committedPositionCount() + buysThisBatch >= p.maxPositions) break;
+          if (!qualifies(track, relaxed)) continue;
+          // Confirmation watch (only when enabled): the first qualifying
+          // touch starts the clock. Buy on a later touch once the delay has
+          // passed, the price has held up, and the watch is still fresh.
+          if (p.confirmDelaySlots >= 0) {
+            if (track.confirmSlot < 0) {
+              track.confirmSlot = state.slot;
+              track.confirmPrice = track.lastPrice;
+              continue;
+            }
+            if (state.slot - track.confirmSlot < p.confirmDelaySlots) continue;
+            if (changeBps(track.confirmPrice, track.lastPrice) < -p.confirmMaxDropBps) {
+              // Sagged while watched: it was a top, not an ignition. Reset
+              // and make it qualify from scratch.
+              track.confirmSlot = -1;
+              track.confirmPrice = 0;
+              continue;
+            }
+            if (state.slot - track.confirmSlot > p.confirmWindowSlots) {
+              track.confirmSlot = state.slot;
+              track.confirmPrice = track.lastPrice;
+              continue;
+            }
+          }
+          const cap = state.maxBuyLamports(track.mint);
+          let stake = stakeLamports(track, relaxed, stakeScale);
           if (stake > cap) stake = cap;
-          if (stake < solToLamports(MIN_BUY_SOL)) continue; // under the round-trip floor: not worth a slot
-          if (openCost + stake > solToLamports(params.maxExposureSol)) continue;
-          if (free < stake + txFee + solToLamports(params.cashBufferSol)) continue;
-          orders.push({ side: 'buy', mint, quote_lamports: stake, max_slippage_bps: params.buySlipBps });
-          spend(stake);
-          openCost += stake;
-          slots -= 1;
-          const book = bookFor(mint);
-          book.entries += 1;
-          book.entrySlot = slot;
-          book.peakValue = 0n;
+          if (stake < 12_000_000n) continue;
+          const txFee = state.txFeeLamports();
+          const buffer = BigInt(Math.floor(p.cashBufferSol * LAMPORTS_PER_SOL_NUM));
+          if (state.freeCashLamports() < buffer + stake + txFee) continue;
+          orders.push({
+            side: 'buy',
+            mint: track.mint,
+            quote_lamports: stake,
+            max_slippage_bps: p.buySlippageBps,
+          });
+          buysSent += 1;
+          buysThisBatch += 1;
+        }
+      }
+
+      // --- 5. Light pruning: drop dead curves we never touched.
+      if (batchesSeen % 2000 === 0) {
+        for (const [mint, track] of tracks) {
+          if (track.holding || state.positions.has(mint)) continue;
+          if (track.complete || state.slot - track.lastTradeSlot > 10000) {
+            tracks.delete(mint);
+          }
         }
       }
 
       return orders;
+    },
+
+    onDone(state: BotState, done: Done): void {
+      const net = state.cash - BigInt(state.hello.capital.lamports);
+      console.error(
+        `[sharpe] done reason=${done.reason} batches=${batchesSeen} ` +
+          `trips=${tripsDone} mints=${mintsTraded.size} ` +
+          `buys=${buysSent} sells=${sellsSent} net=${Number(net) / LAMPORTS_PER_SOL_NUM} SOL`,
+      );
     },
   };
 }
